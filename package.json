@@ -1,0 +1,27 @@
+{
+  "name": "app-mesh-ecs",
+  "version": "0.1.0",
+  "bin": {
+    "app-mesh-ecs": "bin/app-mesh-ecs.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk"
+  },
+  "devDependencies": {
+    "@aws-cdk/assert": "^1.31.0",
+    "@types/node": "12.12.31",
+    "aws-cdk": "^1.31.0",
+    "ts-node": "^8.1.0",
+    "typescript": "~3.8.3"
+  },
+  "dependencies": {
+    "@aws-cdk/aws-ec2": "^1.31.0",
+    "@aws-cdk/aws-ecr-assets": "^1.31.0",
+    "@aws-cdk/aws-ecs": "^1.31.0",
+    "@aws-cdk/aws-elasticloadbalancingv2": "^1.31.0",
+    "@aws-cdk/aws-servicediscovery": "^1.31.0",
+    "@aws-cdk/core": "^1.31.0"
+  }
+}

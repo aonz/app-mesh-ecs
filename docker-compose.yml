@@ -1,0 +1,24 @@
+version: "3.7"
+services:
+  frontend.ecs.local:
+    container_name: frontend
+    image: node:12.6.0
+    working_dir: /usr/src/app
+    command: ["npm", "run", "start"]
+    environment:
+      - PORT=80
+    volumes:
+      - ./frontend:/usr/src/app
+    ports:
+      - "8080:80"
+  backend.ecs.local:
+    container_name: backend
+    image: node:12.6.0
+    working_dir: /usr/src/app
+    command: ["npm", "run", "start"]
+    environment:
+      - PORT=80
+    volumes:
+      - ./backend:/usr/src/app
+    ports:
+      - "8081:80"
