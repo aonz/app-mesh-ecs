@@ -1,8 +1,11 @@
+import * as appmesh from '@aws-cdk/aws-appmesh';
 import * as cdk from '@aws-cdk/core';
 import * as ec2 from '@aws-cdk/aws-ec2';
+import * as ecr from '@aws-cdk/aws-ecr';
 import * as ecs from '@aws-cdk/aws-ecs';
 import * as ecrAssets from '@aws-cdk/aws-ecr-assets';
 import * as elbv2 from '@aws-cdk/aws-elasticloadbalancingv2';
+import * as iam from '@aws-cdk/aws-iam';
 import * as servicediscovery from '@aws-cdk/aws-servicediscovery';
 
 import * as path from 'path';
@@ -19,18 +22,44 @@ export class AppMeshEcsStack extends cdk.Stack {
 
     const cluster = new ecs.Cluster(this, 'Cluster', { vpc });
 
+    const envoyImage =
+      '840364872350.dkr.ecr.ap-southeast-1.amazonaws.com/aws-appmesh-envoy:v1.12.2.1-prod';
+    const proxyConfiguration = new ecs.AppMeshProxyConfiguration({
+      containerName: 'envoy', properties: {
+        ignoredUID: 1337, proxyIngressPort: 15000, proxyEgressPort: 15001,
+        appPorts: [80], egressIgnoredIPs: ['169.254.170.2', '169.254.169.254']
+      }
+    });
+    const healthCheck = {
+      command: ['CMD-SHELL', 'curl -s http://localhost:9901/server_info | grep state | grep -q LIVE'],
+      startPeriod: cdk.Duration.seconds(10), interval: cdk.Duration.seconds(5),
+      timeout: cdk.Duration.seconds(2), retries: 3
+    }
+    const executionRole = new iam.Role(this, 'ExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com')
+    });
+    executionRole.addManagedPolicy(
+      iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'));
+
     const frontendTaskDefinition =
       new ecs.FargateTaskDefinition(this, 'FrontendTaskDefinition', {
-        memoryLimitMiB: 512, cpu: 256
+        memoryLimitMiB: 512, cpu: 256, proxyConfiguration, executionRole
       });
     const frontendImage = new ecrAssets.DockerImageAsset(this, 'FrontendImage', {
       directory: path.join(__dirname, '../', 'frontend')
     });
-    const frontendContainer = frontendTaskDefinition
-      .addContainer('FrontendContainer', {
-        image: ecs.ContainerImage.fromDockerImageAsset(frontendImage)
-      });
+    const frontendContainer = frontendTaskDefinition.addContainer('frontend', {
+      image: ecs.ContainerImage.fromDockerImageAsset(frontendImage)
+    });
     frontendContainer.addPortMappings({ containerPort: 80 });
+    const frontendEnvoyContainer = frontendTaskDefinition.addContainer('envoy', {
+      image: ecs.ContainerImage.fromRegistry(envoyImage),
+      environment: { 'APPMESH_VIRTUAL_NODE_NAME': 'mesh/ecs/virtualNode/frontend' },
+      essential: true, user: '1337', healthCheck
+    });
+    frontendContainer.addContainerDependencies({
+      container: frontendEnvoyContainer, condition: ecs.ContainerDependencyCondition.HEALTHY
+    });
     const frontendService = new ecs.FargateService(this, 'FrontendService', {
       cluster, taskDefinition: frontendTaskDefinition, desiredCount: 1,
       serviceName: 'frontend', cloudMapOptions: { name: 'frontend', cloudMapNamespace }
@@ -43,16 +72,23 @@ export class AppMeshEcsStack extends cdk.Stack {
 
     const backendTaskDefinition =
       new ecs.FargateTaskDefinition(this, 'BackendTaskDefinition', {
-        memoryLimitMiB: 512, cpu: 256
+        memoryLimitMiB: 512, cpu: 256, proxyConfiguration, executionRole
       });
     const backendImage = new ecrAssets.DockerImageAsset(this, 'BackendImage', {
       directory: path.join(__dirname, '../', 'backend')
     });
-    const backendContainer = backendTaskDefinition
-      .addContainer('BackendContainer', {
-        image: ecs.ContainerImage.fromDockerImageAsset(backendImage)
-      });
+    const backendContainer = backendTaskDefinition.addContainer('backend', {
+      image: ecs.ContainerImage.fromDockerImageAsset(backendImage)
+    });
     backendContainer.addPortMappings({ containerPort: 80 });
+    const backendEnvoyContainer = backendTaskDefinition.addContainer('envoy', {
+      image: ecs.ContainerImage.fromRegistry(envoyImage),
+      environment: { 'APPMESH_VIRTUAL_NODE_NAME': 'mesh/ecs/virtualNode/backend' },
+      essential: true, user: '1337', healthCheck
+    });
+    backendContainer.addContainerDependencies({
+      container: backendEnvoyContainer, condition: ecs.ContainerDependencyCondition.HEALTHY
+    });
     const securityGroup = new ec2.SecurityGroup(this, 'SecurityGroup', {
       vpc, allowAllOutbound: true
     });
@@ -61,6 +97,40 @@ export class AppMeshEcsStack extends cdk.Stack {
       cluster, taskDefinition: backendTaskDefinition, desiredCount: 1,
       serviceName: 'backend', cloudMapOptions: { name: 'backend', cloudMapNamespace },
       securityGroup
+    });
+
+    // Step 2 - ECS + App Mesh
+    const mesh = new appmesh.Mesh(this, 'AppMesh', { meshName: 'ecs' });
+    const frontendVirtualRouter = mesh.addVirtualRouter('FrontendVirtualRouter', {
+      virtualRouterName: 'frontend',
+      listener: { portMapping: { port: 80, protocol: appmesh.Protocol.HTTP } }
+    })
+    const backendVirtualRouter = mesh.addVirtualRouter('BackendVirtualRouter', {
+      virtualRouterName: 'backend',
+      listener: { portMapping: { port: 80, protocol: appmesh.Protocol.HTTP } }
+    })
+    mesh.addVirtualService('FrontendVirtualService', {
+      virtualServiceName: 'frontend.ecs.local', virtualRouter: frontendVirtualRouter
+    });
+    const backendVirtualService = mesh.addVirtualService('BackendVirtualService', {
+      virtualServiceName: 'backend.ecs.local', virtualRouter: backendVirtualRouter
+    });
+    const frontendVirtualNode = mesh.addVirtualNode('FrontendVirtualNode', {
+      virtualNodeName: 'frontend', dnsHostName: 'frontend.ecs.local',
+      listener: { portMapping: { port: 80, protocol: appmesh.Protocol.HTTP } },
+      backends: [backendVirtualService]
+    });
+    const backendVirtualNode = mesh.addVirtualNode('BackendVirtualNode', {
+      virtualNodeName: 'backend', dnsHostName: 'backend.ecs.local',
+      listener: { portMapping: { port: 80, protocol: appmesh.Protocol.HTTP } }
+    });
+    frontendVirtualRouter.addRoute('FrontendRoute', {
+      routeName: 'frontend', routeType: appmesh.RouteType.HTTP,
+      routeTargets: [{ virtualNode: frontendVirtualNode, weight: 100 }],
+    });
+    backendVirtualRouter.addRoute('BackendRoute', {
+      routeName: 'backend', routeType: appmesh.RouteType.HTTP,
+      routeTargets: [{ virtualNode: backendVirtualNode, weight: 100 }]
     });
   }
 }
