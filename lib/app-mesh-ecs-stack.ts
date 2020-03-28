@@ -6,6 +6,7 @@ import * as ecs from '@aws-cdk/aws-ecs';
 import * as ecrAssets from '@aws-cdk/aws-ecr-assets';
 import * as elbv2 from '@aws-cdk/aws-elasticloadbalancingv2';
 import * as iam from '@aws-cdk/aws-iam';
+import * as secretsmanager from '@aws-cdk/aws-secretsmanager';
 import * as servicediscovery from '@aws-cdk/aws-servicediscovery';
 
 import * as path from 'path';
@@ -13,6 +14,23 @@ import * as path from 'path';
 export class AppMeshEcsStack extends cdk.Stack {
   constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    // Step 3 - ECS + App Mesh with TLS
+    const envoyRepository = new ecr.Repository(this, 'EnvoyRepository', {
+      repositoryName: 'aws-appmesh-envoy',
+      removalPolicy: cdk.RemovalPolicy.DESTROY
+    });
+    new secretsmanager.Secret(this, 'CaBackendCertSecret',
+      { secretName: 'ca_backend_cert' });
+    // new secretsmanager.Secret(this, 'BackendCertSecret',
+    //   { secretName: 'backend_cert' });
+    new secretsmanager.Secret(this, 'BackendKeySecret',
+      { secretName: 'backend_key' });
+    new secretsmanager.Secret(this, 'BackendCertChainSecret',
+      { secretName: 'backend_cert_chain' });
+    const account = cdk.Stack.of(this).account;
+    const envoyImage =
+      `${account}.dkr.ecr.ap-southeast-1.amazonaws.com/aws-appmesh-envoy:v1.12.2.1-prod`;
 
     // Step 1 - ECS
     const vpc = new ec2.Vpc(this, 'Vpc', { cidr: '20.0.0.0/24', natGateways: 1 });
@@ -22,8 +40,8 @@ export class AppMeshEcsStack extends cdk.Stack {
 
     const cluster = new ecs.Cluster(this, 'Cluster', { vpc });
 
-    const envoyImage =
-      '840364872350.dkr.ecr.ap-southeast-1.amazonaws.com/aws-appmesh-envoy:v1.12.2.1-prod';
+    // const envoyImage =
+    //   '840364872350.dkr.ecr.ap-southeast-1.amazonaws.com/aws-appmesh-envoy:v1.12.2.1-prod';
     const proxyConfiguration = new ecs.AppMeshProxyConfiguration({
       containerName: 'envoy', properties: {
         ignoredUID: 1337, proxyIngressPort: 15000, proxyEgressPort: 15001,
@@ -40,23 +58,34 @@ export class AppMeshEcsStack extends cdk.Stack {
     });
     executionRole.addManagedPolicy(
       iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'));
+    const taskRole = new iam.Role(this, 'TaskRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com')
+    });
+    taskRole.addManagedPolicy(
+      iam.ManagedPolicy.fromAwsManagedPolicyName('SecretsManagerReadWrite'));
 
     const frontendTaskDefinition =
       new ecs.FargateTaskDefinition(this, 'FrontendTaskDefinition', {
-        memoryLimitMiB: 512, cpu: 256, proxyConfiguration, executionRole
+        memoryLimitMiB: 512, cpu: 256, proxyConfiguration, executionRole, taskRole
       });
     const frontendImage = new ecrAssets.DockerImageAsset(this, 'FrontendImage', {
       directory: path.join(__dirname, '../', 'frontend')
     });
     const frontendContainer = frontendTaskDefinition.addContainer('frontend', {
-      image: ecs.ContainerImage.fromDockerImageAsset(frontendImage)
+      image: ecs.ContainerImage.fromDockerImageAsset(frontendImage),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'frontend' })
     });
     frontendContainer.addPortMappings({ containerPort: 80 });
     const frontendEnvoyContainer = frontendTaskDefinition.addContainer('envoy', {
       image: ecs.ContainerImage.fromRegistry(envoyImage),
-      environment: { 'APPMESH_VIRTUAL_NODE_NAME': 'mesh/ecs/virtualNode/frontend' },
-      essential: true, user: '1337', healthCheck
+      environment: {
+        'APPMESH_VIRTUAL_NODE_NAME': 'mesh/ecs/virtualNode/frontend',
+        'CERTIFICATE_NAME': 'frontend'
+      },
+      essential: true, user: '1337', healthCheck,
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'frontend' })
     });
+    frontendEnvoyContainer.addPortMappings({ containerPort: 9901 });
     frontendContainer.addContainerDependencies({
       container: frontendEnvoyContainer, condition: ecs.ContainerDependencyCondition.HEALTHY
     });
@@ -72,20 +101,26 @@ export class AppMeshEcsStack extends cdk.Stack {
 
     const backendTaskDefinition =
       new ecs.FargateTaskDefinition(this, 'BackendTaskDefinition', {
-        memoryLimitMiB: 512, cpu: 256, proxyConfiguration, executionRole
+        memoryLimitMiB: 512, cpu: 256, proxyConfiguration, executionRole, taskRole
       });
     const backendImage = new ecrAssets.DockerImageAsset(this, 'BackendImage', {
       directory: path.join(__dirname, '../', 'backend')
     });
     const backendContainer = backendTaskDefinition.addContainer('backend', {
-      image: ecs.ContainerImage.fromDockerImageAsset(backendImage)
+      image: ecs.ContainerImage.fromDockerImageAsset(backendImage),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'backend' })
     });
     backendContainer.addPortMappings({ containerPort: 80 });
     const backendEnvoyContainer = backendTaskDefinition.addContainer('envoy', {
       image: ecs.ContainerImage.fromRegistry(envoyImage),
-      environment: { 'APPMESH_VIRTUAL_NODE_NAME': 'mesh/ecs/virtualNode/backend' },
-      essential: true, user: '1337', healthCheck
+      environment: {
+        'APPMESH_VIRTUAL_NODE_NAME': 'mesh/ecs/virtualNode/backend',
+        'CERTIFICATE_NAME': 'backend'
+      },
+      essential: true, user: '1337', healthCheck,
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'backend' })
     });
+    backendEnvoyContainer.addPortMappings({ containerPort: 9901 });
     backendContainer.addContainerDependencies({
       container: backendEnvoyContainer, condition: ecs.ContainerDependencyCondition.HEALTHY
     });
@@ -120,10 +155,42 @@ export class AppMeshEcsStack extends cdk.Stack {
       listener: { portMapping: { port: 80, protocol: appmesh.Protocol.HTTP } },
       backends: [backendVirtualService]
     });
+    const frontendCfnVirtualNode = frontendVirtualNode.node.defaultChild as appmesh.CfnVirtualNode;
+    frontendCfnVirtualNode.addPropertyOverride('Spec.BackendDefaults', {
+      ClientPolicy: {
+        TLS: {
+          Validation: {
+            Trust: {
+              File: {
+                CertificateChain: '/keys/ca_backend_cert.pem'
+              }
+            }
+          }
+        }
+      }
+    });
     const backendVirtualNode = mesh.addVirtualNode('BackendVirtualNode', {
       virtualNodeName: 'backend', dnsHostName: 'backend.ecs.local',
       listener: { portMapping: { port: 80, protocol: appmesh.Protocol.HTTP } }
     });
+    const backendCfnVirtualNode = backendVirtualNode.node.defaultChild as appmesh.CfnVirtualNode;
+    backendCfnVirtualNode.addPropertyOverride('Spec.Listeners', [
+      {
+        PortMapping: {
+          Port: 80,
+          Protocol: 'http'
+        },
+        TLS: {
+          Mode: 'STRICT',
+          Certificate: {
+            File: {
+              PrivateKey: '/keys/backend_key.pem',
+              CertificateChain: '/keys/backend_cert_chain.pem'
+            }
+          }
+        }
+      }
+    ]);
     frontendVirtualRouter.addRoute('FrontendRoute', {
       routeName: 'frontend', routeType: appmesh.RouteType.HTTP,
       routeTargets: [{ virtualNode: frontendVirtualNode, weight: 100 }],

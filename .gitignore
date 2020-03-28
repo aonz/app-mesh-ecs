@@ -9,3 +9,7 @@ cdk.out
 
 !frontend/*.js
 !backend/*.js
+
+.env.local
+*.pem
+
