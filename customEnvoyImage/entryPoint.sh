@@ -2,7 +2,8 @@
 
 # $1=Secret Name
 getSecret() {
-    aws secretsmanager get-secret-value --secret-id $1 | jq -r .SecretString > /keys/${1}.pem
+    aws secretsmanager get-secret-value --secret-id $1 --region $AWS_REGION \
+      | jq -r .SecretString > /keys/$1.pem
     echo "Added $1 to container"
 }
 

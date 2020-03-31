@@ -39,6 +39,16 @@ export class AppMeshEcsStack extends cdk.Stack {
       'PrivateDnsNamespace', { name: 'ecs.local', vpc });
 
     const cluster = new ecs.Cluster(this, 'Cluster', { vpc });
+    cluster.addCapacity('DefaultAutoScalingGroupCapacity', {
+      instanceType: new ec2.InstanceType('t3a.medium'), desiredCapacity: 1,
+      keyName: 'app-mesh-ecs'
+    });
+
+    const securityGroup = new ec2.SecurityGroup(this, 'SecurityGroup', {
+      vpc, allowAllOutbound: true
+    });
+    securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Port 80');
+    securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(22), 'Port 22');
 
     // const envoyImage =
     //   '840364872350.dkr.ecr.ap-southeast-1.amazonaws.com/aws-appmesh-envoy:v1.12.2.1-prod';
@@ -64,34 +74,39 @@ export class AppMeshEcsStack extends cdk.Stack {
     taskRole.addManagedPolicy(
       iam.ManagedPolicy.fromAwsManagedPolicyName('SecretsManagerReadWrite'));
 
+    const dnsTtl = cdk.Duration.seconds(0);
+
     const frontendTaskDefinition =
-      new ecs.FargateTaskDefinition(this, 'FrontendTaskDefinition', {
-        memoryLimitMiB: 512, cpu: 256, proxyConfiguration, executionRole, taskRole
+      new ecs.Ec2TaskDefinition(this, 'FrontendTaskDefinition', {
+        // memoryLimitMiB: 512, cpu: 256, 
+        proxyConfiguration, executionRole, taskRole, networkMode: ecs.NetworkMode.AWS_VPC
       });
     const frontendImage = new ecrAssets.DockerImageAsset(this, 'FrontendImage', {
       directory: path.join(__dirname, '../', 'frontend')
     });
     const frontendContainer = frontendTaskDefinition.addContainer('frontend', {
       image: ecs.ContainerImage.fromDockerImageAsset(frontendImage),
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'frontend' })
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'frontend' }),
+      cpu: 128, memoryLimitMiB: 256
     });
     frontendContainer.addPortMappings({ containerPort: 80 });
     const frontendEnvoyContainer = frontendTaskDefinition.addContainer('envoy', {
       image: ecs.ContainerImage.fromRegistry(envoyImage),
       environment: {
         'APPMESH_VIRTUAL_NODE_NAME': 'mesh/ecs/virtualNode/frontend',
-        'CERTIFICATE_NAME': 'frontend'
+        'CERTIFICATE_NAME': 'frontend', 'AWS_REGION': 'ap-southeast-1'
       },
       essential: true, user: '1337', healthCheck,
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'frontend' })
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'frontend' }),
+      cpu: 64, memoryLimitMiB: 128
     });
     frontendEnvoyContainer.addPortMappings({ containerPort: 9901 });
     frontendContainer.addContainerDependencies({
       container: frontendEnvoyContainer, condition: ecs.ContainerDependencyCondition.HEALTHY
     });
-    const frontendService = new ecs.FargateService(this, 'FrontendService', {
-      cluster, taskDefinition: frontendTaskDefinition, desiredCount: 1,
-      serviceName: 'frontend', cloudMapOptions: { name: 'frontend', cloudMapNamespace }
+    const frontendService = new ecs.Ec2Service(this, 'FrontendService', {
+      serviceName: 'frontend', cluster, taskDefinition: frontendTaskDefinition, desiredCount: 1,
+      securityGroup, cloudMapOptions: { name: 'frontend', cloudMapNamespace, dnsTtl }
     });
 
     const lb = new elbv2.ApplicationLoadBalancer(this, 'ALB',
@@ -100,38 +115,36 @@ export class AppMeshEcsStack extends cdk.Stack {
     listener.addTargets('Target', { port: 80, targets: [frontendService] });
 
     const backendTaskDefinition =
-      new ecs.FargateTaskDefinition(this, 'BackendTaskDefinition', {
-        memoryLimitMiB: 512, cpu: 256, proxyConfiguration, executionRole, taskRole
+      new ecs.Ec2TaskDefinition(this, 'BackendTaskDefinition', {
+        // memoryLimitMiB: 512, cpu: 256, 
+        proxyConfiguration, executionRole, taskRole, networkMode: ecs.NetworkMode.AWS_VPC
       });
     const backendImage = new ecrAssets.DockerImageAsset(this, 'BackendImage', {
       directory: path.join(__dirname, '../', 'backend')
     });
     const backendContainer = backendTaskDefinition.addContainer('backend', {
       image: ecs.ContainerImage.fromDockerImageAsset(backendImage),
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'backend' })
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'backend' }),
+      cpu: 128, memoryLimitMiB: 256
     });
     backendContainer.addPortMappings({ containerPort: 80 });
     const backendEnvoyContainer = backendTaskDefinition.addContainer('envoy', {
       image: ecs.ContainerImage.fromRegistry(envoyImage),
       environment: {
         'APPMESH_VIRTUAL_NODE_NAME': 'mesh/ecs/virtualNode/backend',
-        'CERTIFICATE_NAME': 'backend'
+        'CERTIFICATE_NAME': 'backend', 'AWS_REGION': 'ap-southeast-1'
       },
       essential: true, user: '1337', healthCheck,
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'backend' })
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'backend' }),
+      cpu: 64, memoryLimitMiB: 128
     });
     backendEnvoyContainer.addPortMappings({ containerPort: 9901 });
     backendContainer.addContainerDependencies({
       container: backendEnvoyContainer, condition: ecs.ContainerDependencyCondition.HEALTHY
     });
-    const securityGroup = new ec2.SecurityGroup(this, 'SecurityGroup', {
-      vpc, allowAllOutbound: true
-    });
-    securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Port 80');
-    new ecs.FargateService(this, 'BackendService', {
-      cluster, taskDefinition: backendTaskDefinition, desiredCount: 1,
-      serviceName: 'backend', cloudMapOptions: { name: 'backend', cloudMapNamespace },
-      securityGroup
+    new ecs.Ec2Service(this, 'BackendService', {
+      serviceName: 'backend', cluster, taskDefinition: backendTaskDefinition, desiredCount: 1,
+      securityGroup, cloudMapOptions: { name: 'backend', cloudMapNamespace, dnsTtl },
     });
 
     // Step 2 - ECS + App Mesh
@@ -198,6 +211,12 @@ export class AppMeshEcsStack extends cdk.Stack {
     backendVirtualRouter.addRoute('BackendRoute', {
       routeName: 'backend', routeType: appmesh.RouteType.HTTP,
       routeTargets: [{ virtualNode: backendVirtualNode, weight: 100 }]
+    });
+
+    new ec2.Instance(this, 'BastionInstance', {
+      vpc, vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC }, securityGroup,
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3A, ec2.InstanceSize.NANO),
+      machineImage: ec2.MachineImage.latestAmazonLinux(), keyName: 'app-mesh-ecs',
     });
   }
 }
